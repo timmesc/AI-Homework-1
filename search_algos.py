@@ -22,13 +22,18 @@ def get_neighbors(cell, size):
     return neighbors
 
 
-
-def a_star_search(known_grid, start, goal, size, tie_break, counter, g, search_val):
+def a_star_search(known_grid, start, goal, size, tie_break, counter, g, search_val,
+                  h_values=None, return_closed=False):
     """
-Single A* search from start to goal using agent's current knowledge.
-tie_break: 'larger_g' or 'smaller_g'
-Returns (path, expanded_count) or (None, expanded_count) if no path.
-"""
+    Single A* search from start to goal using agent's current knowledge.
+    tie_break: 'larger_g' or 'smaller_g'
+
+    Returns:
+        - default: (path, expanded_count) or (None, expanded_count) if no path.
+        - if return_closed=True: (path, expanded_count, closed_list) or (None, expanded_count, closed_list)
+          where closed_list contains the expanded states (goal excluded).
+    """
+
     # Initialize start state: distance from start to itself is 0
     g[start] = 0
     search_val[start] = counter
@@ -44,10 +49,18 @@ Returns (path, expanded_count) or (None, expanded_count) if no path.
     # Closed set: cells we've already fully explored
     open_list = []
     closed_set = set()
+    closed_list = []  # keep expansion order for Adaptive A*
 
-    # Calculate f-value for start: f = g + h = 0 + manhattan_distance
-    h = manhattan_distance(start, goal)
-    f = h  # since g(start) = 0
+    def h_of(cell):
+        # If adaptive heuristic table exists and contains this cell, use it.
+        # Otherwise fall back to Manhattan distance.
+        if h_values is not None and cell in h_values:
+            return h_values[cell]
+        return manhattan_distance(cell, goal)
+
+    # Calculate f-value for start: f = g + h = 0 + heuristic
+    h = h_of(start)
+    f = h
 
     # Push start onto open list with appropriate tie-breaking
     # Python's heapq is a MIN-heap, so smallest value gets popped first
@@ -64,9 +77,7 @@ Returns (path, expanded_count) or (None, expanded_count) if no path.
         # Pop the cell with the smallest priority (lowest f, then tiebreaker)
         f_val, tie_val, s = heapq.heappop(open_list)
 
-        # Skip stale entries: if this cell was already expanded, ignore it
-        # (This happens because heapq doesn't support "decrease-key", so we
-        #  push duplicates and skip the old ones when we pop them)
+        # Skip stale entries
         if s in closed_set:
             continue
 
@@ -77,6 +88,7 @@ Returns (path, expanded_count) or (None, expanded_count) if no path.
 
         # Mark this cell as expanded (add to closed set)
         closed_set.add(s)
+        closed_list.append(s)
         expanded += 1
 
         # Explore all neighbors of the current cell
@@ -85,7 +97,7 @@ Returns (path, expanded_count) or (None, expanded_count) if no path.
             if known_grid[neighbor[0], neighbor[1]] == 1:
                 continue
 
-            # Skip cells already expanded (they have optimal g-values already)
+            # Skip cells already expanded
             if neighbor in closed_set:
                 continue
 
@@ -101,7 +113,7 @@ Returns (path, expanded_count) or (None, expanded_count) if no path.
                 g[neighbor] = new_g
                 tree[neighbor] = s  # got to neighbor through s
 
-                h = manhattan_distance(neighbor, goal)
+                h = h_of(neighbor)
                 f = new_g + h
 
                 # Push onto open list with tie-breaking priority
@@ -112,6 +124,8 @@ Returns (path, expanded_count) or (None, expanded_count) if no path.
 
     # If never found a path to the goal, return None
     if g[goal] == float('inf'):
+        if return_closed:
+            return None, expanded, closed_list
         return None, expanded
 
     # Reconstruct path by following tree pointers from goal back to start
@@ -121,18 +135,19 @@ Returns (path, expanded_count) or (None, expanded_count) if no path.
         path.append(current)
         current = tree[current]
     path.append(start)
-    path.reverse()  # flip it so it goes start → goal
+    path.reverse()
 
+    if return_closed:
+        return path, expanded, closed_list
     return path, expanded
-
 
 
 def repeated_forward_a_star(full_grid, start, goal, tie_break='larger_g'):
     """
-Repeated Forward A*: agent plans with A*, moves along the path,
-re-plans when it discovers blocked cells.
-Returns (reached_goal, total_expanded, trajectory, num_searches)
-"""
+    Repeated Forward A*: agent plans with A*, moves along the path,
+    re-plans when it discovers blocked cells.
+    Returns (reached_goal, total_expanded, trajectory, num_searches)
+    """
     size = full_grid.shape[0]
 
     # The agent's knowledge grid:
@@ -140,8 +155,8 @@ Returns (reached_goal, total_expanded, trajectory, num_searches)
     #    0 = known unblocked
     #    1 = known blocked
     known_grid = np.full((size, size), -1, dtype=np.int8)
-    known_grid[start] = 0  # agent knows its starting cell is unblocked
-    known_grid[goal] = 0   # agent knows the goal cell is unblocked
+    known_grid[start] = 0
+    known_grid[goal] = 0
 
     # Efficient g-value management across multiple A* searches
     counter = 0
@@ -173,10 +188,6 @@ Returns (reached_goal, total_expanded, trajectory, num_searches)
         # Step 3: Follow the path
         for i in range(1, len(path)):
             next_cell = path[i]
-
-            # Move to the next cell on the path
-            # (This is safe because we observed from the previous position,
-            #  so we know next_cell isn't blocked)
             current = next_cell
             trajectory.append(current)
 
@@ -196,6 +207,155 @@ Returns (reached_goal, total_expanded, trajectory, num_searches)
                     break
 
             # If the path ahead is blocked, stop following it and re-plan
+            if path_blocked:
+                break
+
+    return True, total_expanded, trajectory, num_searches
+
+
+def repeated_backward_a_star(full_grid, start, goal, tie_break='larger_g'):
+    """
+    Repeated Backward A*: each re-planning runs A* from goal (target)
+    to the agent's current cell (current). Then the agent follows the
+    reversed path (current -> goal).
+
+    Returns (reached_goal, total_expanded, trajectory, num_searches)
+    """
+    size = full_grid.shape[0]
+
+    # Agent knowledge:
+    # -1 unknown (treated as unblocked), 0 known free, 1 known blocked
+    known_grid = np.full((size, size), -1, dtype=np.int8)
+    known_grid[start] = 0
+    known_grid[goal] = 0
+
+    # Efficient g-value management across searches (same as forward)
+    counter = 0
+    g = {}
+    search_val = {}
+
+    current = start
+    total_expanded = 0
+    trajectory = [current]
+    num_searches = 0
+
+    while current != goal:
+        # Observe neighbors from current position
+        for n in get_neighbors(current, size):
+            known_grid[n[0], n[1]] = full_grid[n[0], n[1]]
+
+        # BACKWARD A*: search from target(goal) -> agent(current)
+        counter += 1
+        num_searches += 1
+        path_goal_to_current, expanded = a_star_search(
+            known_grid, goal, current, size, tie_break, counter, g, search_val
+        )
+        total_expanded += expanded
+
+        if path_goal_to_current is None:
+            return False, total_expanded, trajectory, num_searches
+
+        # reverse so agent can move current -> goal
+        path = list(reversed(path_goal_to_current))
+
+        # Follow the path until blocked info invalidates the remaining path
+        for i in range(1, len(path)):
+            next_cell = path[i]
+            current = next_cell
+            trajectory.append(current)
+
+            if current == goal:
+                return True, total_expanded, trajectory, num_searches
+
+            # Observe neighbors from new position
+            for n in get_neighbors(current, size):
+                known_grid[n[0], n[1]] = full_grid[n[0], n[1]]
+
+            # If remaining path contains a now-known blocked cell, re-plan
+            path_blocked = False
+            for j in range(i + 1, len(path)):
+                if known_grid[path[j][0], path[j][1]] == 1:
+                    path_blocked = True
+                    break
+
+            if path_blocked:
+                break
+
+    return True, total_expanded, trajectory, num_searches
+
+
+def adaptive_a_star(full_grid, start, goal, tie_break='larger_g'):
+    """
+    Adaptive A*: repeated planning like repeated forward A*,
+    but after each A* search, update h-values for expanded states:
+        h(s) = g(goal) - g(s)
+
+    Returns (reached_goal, total_expanded, trajectory, num_searches)
+    """
+    size = full_grid.shape[0]
+
+    # Agent's knowledge grid:
+    #   -1 = unknown (treated as unblocked)
+    #    0 = known unblocked
+    #    1 = known blocked
+    known_grid = np.full((size, size), -1, dtype=np.int8)
+    known_grid[start] = 0
+    known_grid[goal] = 0
+
+    counter = 0
+    g = {}
+    search_val = {}
+
+    # Adaptive heuristic table: cell -> learned h
+    h_values = {}
+
+    current = start
+    total_expanded = 0
+    trajectory = [current]
+    num_searches = 0
+
+    while current != goal:
+        # Step 1: Observe the 4 adjacent cells from current position
+        for n in get_neighbors(current, size):
+            known_grid[n[0], n[1]] = full_grid[n[0], n[1]]
+
+        # Step 2: Run A* using adaptive heuristic table
+        counter += 1
+        num_searches += 1
+        path, expanded, closed_list = a_star_search(
+            known_grid, current, goal, size, tie_break, counter, g, search_val,
+            h_values=h_values, return_closed=True
+        )
+        total_expanded += expanded
+
+        if path is None:
+            return False, total_expanded, trajectory, num_searches
+
+        # Step 3: Adaptive update (only for expanded states)
+        goal_g = g[goal]
+        for s in closed_list:
+            h_values[s] = goal_g - g[s]
+
+        # Step 4: Follow the path (same logic as repeated forward A*)
+        for i in range(1, len(path)):
+            next_cell = path[i]
+            current = next_cell
+            trajectory.append(current)
+
+            if current == goal:
+                return True, total_expanded, trajectory, num_searches
+
+            # Observe from new position
+            for n in get_neighbors(current, size):
+                known_grid[n[0], n[1]] = full_grid[n[0], n[1]]
+
+            # If remaining path contains a now-known blocked cell, re-plan
+            path_blocked = False
+            for j in range(i + 1, len(path)):
+                if known_grid[path[j][0], path[j][1]] == 1:
+                    path_blocked = True
+                    break
+
             if path_blocked:
                 break
 
